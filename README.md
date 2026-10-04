@@ -3,4 +3,3 @@
 This is a html website that allows everyone (even Mac users!) to test out their ps3 eye cameras! Allows multiple cameras to be used!
 ***Known issues:***
 -adding more than 1 camera in 640x480 might cause lags.
--Frame rates above 60 weren't tested (I only have a 60hz display)
