@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS3 Eye Multi-Camera Tester</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--bd:#2a2f3a;--tx:#e6e8ee;--mu:#8b92a3;--ac:#4f8cff;--ok:#3ecf8e;--er:#ff5d5d}
+@media (prefers-color-scheme:light){:root{--bg:#f4f5f8;--card:#fff;--bd:#d9dce4;--tx:#1b1e26;--mu:#5d6475}}
+*{box-sizing:border-box}
+body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:16px}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:0 0 8px}
+p,.mu{color:var(--mu);margin:4px 0}
+.bar,.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
+button,select{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:7px 12px;font:inherit;cursor:pointer}
+button.p{background:var(--ac);border-color:var(--ac);color:#fff}
+button:hover{filter:brightness(1.1)}
+.panel{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;margin:10px 0}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.tile{background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow:hidden}
+.tile video{width:100%;display:block;background:#000;aspect-ratio:4/3;object-fit:contain}
+.tile .hd,.tile .ft{padding:8px 10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.hd b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.st{font:12px ui-monospace,monospace;color:var(--mu)}
+.ok{color:var(--ok)}.er{color:var(--er)}
+.mir video{transform:scaleX(-1)}
+</style>
+</head>
+<body>
+<h1>PS3 Eye Multi-Camera Tester</h1>
+<p>Chrome / Edge / other Chromium. Open this file directly or serve it from localhost.</p>
+
+<div class="panel">
+  <h2>1 · Standard camera mode (best on Windows)</h2>
+  <p>Needs a PS3 Eye driver installed so it shows up as a normal camera. Add as many as you like; each one gets its own tile.</p>
+  <div class="row">
+    <label>Resolution
+      <select id="res">
+        <option value="640x480">640×480</option>
+        <option value="320x240">320×240</option>
+      </select></label>
+    <label>FPS
+      <select id="fps"></select></label>
+    <label><input type="checkbox" id="onlyEye" checked> Only show likely PS3 Eyes</label>
+  </div>
+  <div class="bar">
+    <button class="p" id="grant">Allow camera access / refresh list</button>
+    <button id="startAll">Start all detected</button>
+    <button id="stopAll">Stop all</button>
+  </div>
+  <div id="devs" class="mu">No cameras listed yet. Click “Allow camera access”.</div>
+</div>
+
+<div class="panel">
+  <h2>2 · Direct USB mode (WebUSB — for Mac, bypasses the OS camera)</h2>
+  <p>macOS never exposes the PS3 Eye as a camera, so it can only be reached over raw USB. This panel talks to PS3 Eyes (USB ID 1415:2000) directly and streams video.</p>
+  <div class="bar"><button class="p" id="usbAdd">Add PS3 Eye over USB</button></div>
+  <div id="usb" class="mu"></div>
+  <p>Pick one camera per click. Uses the PS3 Eye's own protocol (ported from the Linux ov534 driver), so no OS driver is needed. Uses the resolution and FPS chosen above.</p>
+</div>
+
+<div id="grid"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const RATES={640:[83,75,60,50,40,30,25,20,15,10],320:[290,205,187,150,137,125,100,90,75,60,50,40,37,30,17,15,10]};
+const GLITCHY={83:1,205:1,290:1};
+function fillFps(){
+  const w=$('res').value.split('x')[0], keep=+$('fps').value, L=RATES[w];
+  $('fps').innerHTML=L.map(f=>'<option value="'+f+'">'+f+(GLITCHY[f]?' (max, may glitch)':'')+'</option>').join('');
+  $('fps').value=L.includes(keep)?keep:(w==='640'?60:187);
+}
+const live=new Map(); // deviceId -> {stream, tile, timer}
+let known=[];
+
+const looksEye=d=>/ps3|eye|ov534|ov7725|usb camera|sony|playstation|1415/i.test(d.label);
+
+async function refresh(){
+  try{
+    const t=await navigator.mediaDevices.getUserMedia({video:true});
+    t.getTracks().forEach(x=>x.stop());
+  }catch(e){ $('devs').innerHTML='<span class="er">Permission denied or no camera: '+e.message+'</span>'; return; }
+  const all=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
+  known=$('onlyEye').checked?all.filter(looksEye):all;
+  const box=$('devs'); box.innerHTML='';
+  if(!known.length){
+    box.innerHTML='<span class="er">No matching cameras.</span> Untick “Only show likely PS3 Eyes” to see everything. On Mac this is expected — use USB mode.';
+    return;
+  }
+  known.forEach((d,i)=>{
+    const r=document.createElement('div'); r.className='row';
+    r.innerHTML='<span style="flex:1">'+(d.label||'Camera '+(i+1))+'</span>';
+    const b=document.createElement('button'); b.textContent=live.has(d.deviceId)?'Running':'Start';
+    b.onclick=()=>start(d); r.appendChild(b); box.appendChild(r);
+  });
+}
+
+async function start(d){
+  if(live.has(d.deviceId)) return;
+  const [w,h]=$('res').value.split('x').map(Number), f=+$('fps').value;
+  let stream;
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:d.deviceId},width:{ideal:w},height:{ideal:h},frameRate:{ideal:f}}});
+  }catch(e){ alert('Could not start '+d.label+': '+e.message+'\nIf several cameras share one USB controller, try 320×240 or a different port.'); return; }
+  const tile=document.createElement('div'); tile.className='tile';
+  tile.innerHTML='<div class="hd"><b></b><button data-a="mir">Mirror</button><button data-a="snap">Snapshot</button><button data-a="stop">Stop</button></div><video autoplay muted playsinline></video><div class="ft"><span class="st">…</span></div>';
+  tile.querySelector('b').textContent=d.label||'Camera';
+  const v=tile.querySelector('video'); v.srcObject=stream;
+  $('grid').appendChild(tile);
+  const st=tile.querySelector('.st'); let n=0,last=performance.now();
+  const tick=(_,m)=>{ n++; v.requestVideoFrameCallback(tick); }; v.requestVideoFrameCallback(tick);
+  const timer=setInterval(()=>{
+    const now=performance.now(), fps=n/((now-last)/1000); n=0; last=now;
+    const s=stream.getVideoTracks()[0].getSettings();
+    st.innerHTML='<span class="ok">●</span> '+(s.width||'?')+'×'+(s.height||'?')+' · '+fps.toFixed(1)+' fps (target '+(s.frameRate||'?')+')';
+  },1000);
+  stream.getVideoTracks()[0].onended=()=>stop(d.deviceId);
+  tile.onclick=e=>{
+    const a=e.target.dataset.a; if(!a) return;
+    if(a==='mir') tile.classList.toggle('mir');
+    if(a==='stop') stop(d.deviceId);
+    if(a==='snap'){
+      const c=document.createElement('canvas'); c.width=v.videoWidth; c.height=v.videoHeight;
+      c.getContext('2d').drawImage(v,0,0);
+      const l=document.createElement('a'); l.download='ps3eye-'+Date.now()+'.png'; l.href=c.toDataURL(); l.click();
+    }
+  };
+  live.set(d.deviceId,{stream,tile,timer}); refresh();
+}
+function stop(id){
+  const o=live.get(id); if(!o) return;
+  clearInterval(o.timer); o.stream.getTracks().forEach(t=>t.stop()); o.tile.remove(); live.delete(id); refresh();
+}
+
+$('res').onchange=fillFps; fillFps();
+$('grant').onclick=refresh;
+$('onlyEye').onchange=refresh;
+$('startAll').onclick=async()=>{ await refresh(); for(const d of known) await start(d); };
+$('stopAll').onclick=()=>[...live.keys()].forEach(stop);
+navigator.mediaDevices.addEventListener('devicechange',refresh);
+
+const BRIDGE_INIT_772X=[[0x88,0xf8],[0x89,0xff],[0x76,0x03],[0x92,0x01],[0x93,0x18],[0x94,0x10],[0x95,0x10],[0xe2,0x00],[0xe7,0x3e],[0x96,0x00],[0x97,0x20],[0x97,0x20],[0x97,0x20],[0x97,0x0a],[0x97,0x3f],[0x97,0x4a],[0x97,0x20],[0x97,0x15],[0x97,0x0b],[0x8e,0x40],[0x1f,0x81],[0x34,0x05],[0xe3,0x04],[0x89,0x00],[0x76,0x00],[0xe7,0x2e],[0x31,0xf9],[0x25,0x42],[0x21,0xf0],[0x1c,0x0a],[0x1d,0x08],[0x1d,0x0e]];
+const SENSOR_INIT_772X=[[0x12,0x80],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x11,0x01],[0x3d,0x03],[0x17,0x26],[0x18,0xa0],[0x19,0x07],[0x1a,0xf0],[0x32,0x00],[0x29,0xa0],[0x2c,0xf0],[0x65,0x20],[0x11,0x01],[0x42,0x7f],[0x63,0xaa],[0x64,0xff],[0x66,0x00],[0x13,0xf0],[0x0d,0x41],[0x0f,0xc5],[0x14,0x11],[0x22,0x7f],[0x23,0x03],[0x24,0x40],[0x25,0x30],[0x26,0xa1],[0x2a,0x00],[0x2b,0x00],[0x6b,0xaa],[0x13,0xff],[0x90,0x05],[0x91,0x01],[0x92,0x03],[0x93,0x00],[0x94,0x60],[0x95,0x3c],[0x96,0x24],[0x97,0x1e],[0x98,0x62],[0x99,0x80],[0x9a,0x1e],[0x9b,0x08],[0x9c,0x20],[0x9e,0x81],[0xa6,0x07],[0x7e,0x0c],[0x7f,0x16],[0x80,0x2a],[0x81,0x4e],[0x82,0x61],[0x83,0x6f],[0x84,0x7b],[0x85,0x86],[0x86,0x8e],[0x87,0x97],[0x88,0xa4],[0x89,0xaf],[0x8a,0xc5],[0x8b,0xd7],[0x8c,0xe8],[0x8d,0x20],[0x2b,0x00],[0x22,0x7f],[0x23,0x03],[0x11,0x01],[0x64,0xff],[0x0d,0x41],[0x14,0x41],[0x0e,0xcd],[0xac,0xbf],[0x8e,0x00]];
+const BRIDGE_START_VGA_YUYV_772X=[[0x88,0x00],[0x1c,0x00],[0x1d,0x40],[0x1d,0x02],[0x1d,0x00],[0x1d,0x02],[0x1d,0x58],[0x1d,0x00],[0x8d,0x1c],[0x8e,0x80],[0xc0,0x50],[0xc1,0x3c],[0xc2,0x0c],[0xc3,0x69]];
+const SENSOR_START_VGA_YUYV_772X=[[0x12,0x00],[0x17,0x26],[0x18,0xa0],[0x19,0x07],[0x1a,0xf0],[0x29,0xa0],[0x2c,0xf0],[0x65,0x20],[0x67,0x00]];
+const BRIDGE_START_QVGA_YUYV_772X=[[0x88,0x00],[0x1c,0x00],[0x1d,0x40],[0x1d,0x02],[0x1d,0x00],[0x1d,0x01],[0x1d,0x4b],[0x1d,0x00],[0x8d,0x1c],[0x8e,0x80],[0xc0,0x28],[0xc1,0x1e],[0xc2,0x0c],[0xc3,0x69]];
+const SENSOR_START_QVGA_YUYV_772X=[[0x12,0x40],[0x17,0x3f],[0x18,0x50],[0x19,0x03],[0x1a,0x78],[0x29,0x50],[0x2c,0x78],[0x65,0x2f],[0x67,0x00]];
+// ---- Direct USB mode (WebUSB port of Linux gspca ov534, OV772x / PS3 Eye) ----
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+let eyeCount=0; const eyes=new Set();
+class Eye{
+  constructor(dev){this.dev=dev;this.n=++eyeCount;this.run=false;}
+  async w(reg,val){await this.dev.controlTransferOut({requestType:'vendor',recipient:'device',request:1,value:0,index:reg},Uint8Array.of(val));}
+  async r(reg){const x=await this.dev.controlTransferIn({requestType:'vendor',recipient:'device',request:1,value:0,index:reg},1);return x.data.getUint8(0);}
+  async chk(){for(let i=0;i<5;i++){await sleep(15);const d=await this.r(0xf6);if(d===0)return true;if(d===4)return false;}return false;}
+  async sw(reg,val){await this.w(0xf2,reg);await this.w(0xf3,val);await this.w(0xf5,0x37);if(!await this.chk())throw new Error('SCCB write failed (reg 0x'+reg.toString(16)+')');}
+  async sr(reg){await this.w(0xf2,reg);await this.w(0xf5,0x33);await this.chk();await this.w(0xf5,0xf9);await this.chk();return this.r(0xf4);}
+  async bw(t){for(const [a,b] of t)await this.w(a,b);}
+  async swa(t){for(const [a,b] of t){if(a!==0xff)await this.sw(a,b);else{await this.sr(b);await this.sw(0xff,0);}}}
+  async led(on){let d=await this.r(0x21);await this.w(0x21,d|0x80);d=await this.r(0x23);await this.w(0x23,on?d|0x80:d&~0x80);if(!on){d=await this.r(0x21);await this.w(0x21,d&~0x80);}}
+  async open(){
+    const d=this.dev; await d.open(); if(!d.configuration)await d.selectConfiguration(1);
+    await d.claimInterface(0);
+    for(const a of d.configuration.interfaces[0].alternates)for(const e of a.endpoints)if(e.type==='bulk'&&e.direction==='in')this.ep=e.endpointNumber;
+    if(!this.ep)throw new Error('No bulk IN endpoint found');
+    await this.w(0xe7,0x3a);await this.w(0xe0,0x08);await sleep(100);
+    await this.w(0xf1,0x42);await this.sw(0x12,0x80);await sleep(15);
+    await this.sr(0x0a);let id=(await this.sr(0x0a))<<8;await this.sr(0x0b);id|=await this.sr(0x0b);
+    if((id&0xfff0)===0x7670)throw new Error('OV767x sensor (not a PS3 Eye)');
+    this.sid=id;
+    await this.bw(BRIDGE_INIT_772X);await this.led(1);await this.swa(SENSOR_INIT_772X);
+    await this.w(0xe0,0x09);
+  }
+  async start(w,fps){
+    const vga=w===640; this.w_=vga?640:320; this.h_=vga?480:240;
+    await this.bw(vga?BRIDGE_START_VGA_YUYV_772X:BRIDGE_START_QVGA_YUYV_772X);
+    await this.swa(vga?SENSOR_START_VGA_YUYV_772X:SENSOR_START_QVGA_YUYV_772X);
+    const rates=vga?[[83,1,0xc1,2],[75,1,0x81,2],[60,0,0x41,4],[50,1,0x41,2],[40,2,0xc1,4],[30,4,0x81,2],[25,0,0x01,2],[20,4,0x41,2],[15,9,0x81,2],[10,9,0x41,2]]
+      :[[290,0,0xc1,4],[205,1,0xc1,2],[187,1,0x81,2],[150,0,0x41,4],[137,2,0xc1,2],[125,1,0x41,2],[100,2,0xc1,4],[90,3,0x81,2],[75,4,0x81,2],[60,4,0xc1,4],[50,4,0x41,2],[40,6,0x81,3],[37,0,0x01,4],[30,4,0x41,4],[17,0x18,0xc1,2],[15,0x18,0x81,2],[10,0x18,0x41,2]];
+    const m=rates.find(x=>fps>=x[0])||rates[rates.length-1];
+    await this.sw(0x11,m[1]);await this.sw(0x0d,m[2]);await this.w(0xe5,m[3]);this.fps=m[0];
+    // default controls from the Linux driver
+    await this.sw(0xa7,64);await this.sw(0xa8,64);
+    await this.sw(0x13,(await this.sr(0x13))|0x04);await this.sw(0x64,(await this.sr(0x64))|3);
+    await this.sw(0x13,(await this.sr(0x13))|0x02);await this.sw(0x63,(await this.sr(0x63))|0xc0);
+    await this.sw(0x13,(await this.sr(0x13))|0x01);
+    await this.sw(0x08,120>>7);await this.sw(0x10,(120<<1)&255);
+    await this.sw(0x9b,0);await this.sw(0x9c,32);
+    await this.sw(0x0c,((await this.sr(0x0c))&~0xc0)|0xc0);await this.sw(0x2b,0);
+    await this.led(1);await this.w(0xe0,0x00);
+  }
+  async stop(){
+    this.run=false; await sleep(50);
+    try{await this.w(0xe0,0x09);await this.led(0);await this.dev.releaseInterface(0);await this.dev.close();}catch(e){}
+  }
+}
+function yuyv2rgba(src,dst,n){ // n = pixel pairs
+  for(let i=0,j=0;i<n*4;i+=4,j+=8){
+    const y0=src[i],u=src[i+1]-128,y1=src[i+2],v=src[i+3]-128;
+    const r=1.402*v,g=-0.344*u-0.714*v,b=1.772*u;
+    dst[j]=y0+r;dst[j+1]=y0+g;dst[j+2]=y0+b;dst[j+3]=255;
+    dst[j+4]=y1+r;dst[j+5]=y1+g;dst[j+6]=y1+b;dst[j+7]=255;
+  }
+}
+async function addUsb(dev){
+  const eye=new Eye(dev); const note=t=>$('usb').insertAdjacentHTML('beforeend',t);
+  const [w]=$('res').value.split('x').map(Number), f=+$('fps').value;
+  try{ await eye.open(); await eye.start(w,f); }
+  catch(e){ note('<div class="er">PS3 Eye: '+e.message+'</div>'); try{await dev.close();}catch(_){} return; }
+  eyes.add(eye);
+  const W=eye.w_,H=eye.h_,SZ=W*H*2;
+  const tile=document.createElement('div'); tile.className='tile';
+  tile.innerHTML='<div class="hd"><b>PS3 Eye #'+eye.n+' (USB)</b><button data-a="mir">Mirror</button><button data-a="snap">Snapshot</button><button data-a="stop">Stop</button></div><canvas style="width:100%;display:block;background:#000;aspect-ratio:4/3"></canvas><div class="ft"><span class="st">…</span></div>';
+  const cv=tile.querySelector('canvas'); cv.width=W; cv.height=H; const cx=cv.getContext('2d');
+  const img=cx.createImageData(W,H), px=new Uint8ClampedArray(img.data.buffer);
+  $('grid').appendChild(tile);
+  let frames=0,last=performance.now(),total=0; const st=tile.querySelector('.st');
+  const timer=setInterval(()=>{const n=performance.now();st.innerHTML='<span class="ok">●</span> '+W+'×'+H+' · '+(frames/((n-last)/1000)).toFixed(1)+' fps from camera (target '+eye.fps+') · showing '+(shown/((n-last)/1000)).toFixed(0)+'/s';frames=0;shown=0;last=n;},1000);
+  const done=async()=>{clearInterval(timer);await eye.stop();eyes.delete(eye);tile.remove();usbList();};
+  tile.onclick=e=>{const a=e.target.dataset.a;if(!a)return;
+    if(a==='mir'){cv.style.transform=cv.style.transform?'':'scaleX(-1)';}
+    if(a==='stop')done();
+    if(a==='snap'){const l=document.createElement('a');l.download='ps3eye-usb-'+Date.now()+'.png';l.href=cv.toDataURL();l.click();}};
+  // frame reassembly (port of sd_pkt_scan)
+  const buf=new Uint8Array(SZ), ready=new Uint8Array(SZ); let hasNew=false,shown=0; let len=0,lpts=0,lfid=0,bad=true;
+  const scan=data=>{
+    for(let o=0;o<data.length;o+=2048){
+      const blk=data.subarray(o,Math.min(o+2048,data.length));
+      if(blk[0]!==12||blk.length<12||(blk[1]&0x40)||!(blk[1]&0x04)){bad=true;continue;}
+      const pts=(blk[5]<<24|blk[4]<<16|blk[3]<<8|blk[2])>>>0, fid=blk[1]&1, pl=blk.subarray(12);
+      if(pts!==lpts||fid!==lfid){lpts=pts;lfid=fid;len=0;bad=false;if(pl.length<=SZ){buf.set(pl,0);len=pl.length;}}
+      else if(blk[1]&0x02){
+        lpts=0;
+        if(!bad&&len+pl.length===SZ){buf.set(pl,len);ready.set(buf);hasNew=true;frames++;}
+        bad=true;
+      }else if(!bad){ if(len+pl.length<=SZ){buf.set(pl,len);len+=pl.length;}else bad=true; }
+    }
+  };
+  eye.run=true;
+  const draw=()=>{ if(!eye.run)return; if(hasNew){hasNew=false;yuyv2rgba(ready,px,SZ/4);cx.putImageData(img,0,0);shown++;} requestAnimationFrame(draw); };
+  requestAnimationFrame(draw);
+  try{
+    const q=Array.from({length:16},()=>dev.transferIn(eye.ep,65536));
+    while(eye.run){
+      const r=await q.shift(); q.push(dev.transferIn(eye.ep,65536));
+      if(r.status==='ok')scan(new Uint8Array(r.data.buffer,r.data.byteOffset,r.data.byteLength));
+      else if(r.status==='stall')await dev.clearHalt('in',eye.ep);
+    }
+  }catch(e){ if(eye.run){st.innerHTML='<span class="er">Stream stopped: '+e.message+'</span>';} }
+}
+const serial=d=>d.serialNumber||'no serial';
+async function usbList(){
+  const box=$('usb'); box.innerHTML='';
+  if(!navigator.usb){box.innerHTML='<span class="er">WebUSB not available in this browser.</span>';return;}
+  const ds=(await navigator.usb.getDevices()).filter(d=>d.vendorId===0x1415&&d.productId===0x2000);
+  box.textContent=ds.length?ds.length+' PS3 Eye(s) authorised. Click “Add PS3 Eye over USB” to start one (pick a different one each time).':'No PS3 Eyes authorised yet.';
+}
+$('usbAdd').onclick=async()=>{
+  if(!navigator.usb)return usbList();
+  let dev;
+  try{dev=await navigator.usb.requestDevice({filters:[{vendorId:0x1415,productId:0x2000}]});}catch(e){return;}
+  if([...eyes].some(x=>x.dev===dev)){alert('That camera is already running.');return;}
+  await addUsb(dev);
+};
+if(navigator.usb){navigator.usb.onconnect=navigator.usb.ondisconnect=usbList;}
+usbList();
+</script>
+</body>
+</html>
